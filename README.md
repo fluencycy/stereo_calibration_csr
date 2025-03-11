@@ -186,9 +186,3 @@ right_image_topic = rospy.get_param('~right_image_topic', '/right/image_raw')
 2.calibrate:
 pattern_size = (9, 6)        # 棋盘格内角点数量 (列, 行)
 square_size = 0.025          # 棋盘格方格边长 (米)，请根据实际棋盘调整
-
-
->>>>>>> 0f664ae (Update code: 修改了xxx功能)
-
-# stereo_calibration
-# stereo_calibration_csr
