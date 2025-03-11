@@ -127,7 +127,7 @@ rosrun <your_package> stereo_matching.py
    ```
 
 ---
-=======
+
 1. 启动 ROS Master 和相机驱动：确保 ROS 主节点已运行（roscore），并启动您的左右相机节点以发布图像。例如，如果使用USB摄像头，可运行两个摄像头驱动使图像发布在/left/image_raw和/right/image_raw话题下。
 
 2. 运行图像采集节点：执行上述图像采集节点脚本，例如：
