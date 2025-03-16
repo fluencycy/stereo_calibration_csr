@@ -5,189 +5,221 @@ import glob
 import os
 import yaml
 
-def compute_reprojection_error(objpoints, imgpoints, rvecs, tvecs, mtx, dist):
-    total_error = 0
-    total_points = 0
-    per_image_errors = []
-    for i in range(len(objpoints)):
-        imgpoints2, _ = cv2.projectPoints(objpoints[i], rvecs[i], tvecs[i], mtx, dist)
-        error = cv2.norm(imgpoints[i], imgpoints2, cv2.NORM_L2) ** 2
-        n = len(objpoints[i])
-        per_err = np.sqrt(error / n)
-        per_image_errors.append(per_err)
-        total_error += error
-        total_points += n
-    rms = np.sqrt(total_error / total_points)
-    return rms, per_image_errors
 
 def main():
-    # 1. 设置棋盘格参数：内角点数和每个方格的真实尺寸（单位：米）
-    pattern_size = (12, 9)  # 棋盘格内角点数
-    square_size = 0.006     # 每个方格尺寸，单位：米
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+    # ============= 1. Set chessboard parameters =============
+    # Note: You should modify according to your actual chessboard inner corners and square size
+    pattern_size = (9, 6)  # Number of inner corners (columns, rows), keep 9x6 if you are using it
+    square_size = 0.010  # Square size (meters), e.g., 1cm
+    criteria_subpix = (
+        cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+        100,
+        1e-6
+    )
 
-    # 准备棋盘格在世界坐标下的三维点（所有图像都相同）
+    # ============= 2. Prepare 3D points of chessboard in world coordinates =============
     objp = np.zeros((pattern_size[0] * pattern_size[1], 3), np.float32)
     objp[:, :2] = np.mgrid[0:pattern_size[0], 0:pattern_size[1]].T.reshape(-1, 2)
     objp *= square_size
 
-    # 2. 载入采集的图像，存储所有图像的三维点与角点
-    objpoints = []         # 3D 点（每一组相同）
-    imgpoints_left = []    # 左相机角点
-    imgpoints_right = []   # 右相机角点
-
+    # ============= 3. Load captured calibration images =============
+    # Your original path: ~/stereo_calib_images
+    # Replace according to your actual path
     image_dir = os.path.expanduser("~/stereo_calib_images")
     left_images = sorted(glob.glob(os.path.join(image_dir, "left_*.png")))
     right_images = sorted(glob.glob(os.path.join(image_dir, "right_*.png")))
 
     if len(left_images) == 0 or len(right_images) == 0:
-        print("未在目录 {} 中找到图像文件".format(image_dir))
+        print(f"Not enough image files found in directory {image_dir}.")
+        return
+    assert len(left_images) == len(right_images), "Mismatched number of left and right images!"
+
+    # Prepare to store corner points
+    objpoints = []
+    imgpoints_left = []
+    imgpoints_right = []
+
+    # ============= 4. Loop through images to extract corners =============
+    for lf, rf in zip(left_images, right_images):
+        imgL_raw = cv2.imread(lf)
+        imgR_raw = cv2.imread(rf)
+        if imgL_raw is None or imgR_raw is None:
+            print(f"Skipping empty file: {lf}, {rf}")
+            continue
+
+        grayL = cv2.cvtColor(imgL_raw, cv2.COLOR_BGR2GRAY)
+        grayR = cv2.cvtColor(imgR_raw, cv2.COLOR_BGR2GRAY)
+
+        retL, cornersL = cv2.findChessboardCorners(
+            grayL, pattern_size,
+            flags=cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE + cv2.CALIB_CB_FAST_CHECK
+        )
+        retR, cornersR = cv2.findChessboardCorners(
+            grayR, pattern_size,
+            flags=cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE + cv2.CALIB_CB_FAST_CHECK
+        )
+
+        if retL and retR:
+            # Further refine to subpixel accuracy
+            cornersL = cv2.cornerSubPix(grayL, cornersL, (11, 11), (-1, -1), criteria_subpix)
+            cornersR = cv2.cornerSubPix(grayR, cornersR, (11, 11), (-1, -1), criteria_subpix)
+
+            objpoints.append(objp)
+            imgpoints_left.append(cornersL)
+            imgpoints_right.append(cornersR)
+        else:
+            print(f"Chessboard corners not detected: {lf} or {rf}")
+
+    if not objpoints:
+        print("Failed to detect any chessboard corners, calibration cannot proceed!")
         return
 
-    for left_file, right_file in zip(left_images, right_images):
-        img_left = cv2.imread(left_file)
-        img_right = cv2.imread(right_file)
-        gray_left = cv2.cvtColor(img_left, cv2.COLOR_BGR2GRAY)
-        gray_right = cv2.cvtColor(img_right, cv2.COLOR_BGR2GRAY)
+    # Assume all images have same size, get size from any image
+    image_size = grayL.shape[::-1]
+    print(f"Image size: {image_size}")
 
-        ret_left, corners_left = cv2.findChessboardCorners(gray_left, pattern_size, None)
-        ret_right, corners_right = cv2.findChessboardCorners(gray_right, pattern_size, None)
-        if ret_left and ret_right:
-            corners_left = cv2.cornerSubPix(gray_left, corners_left, (11, 11), (-1, -1), criteria)
-            corners_right = cv2.cornerSubPix(gray_right, corners_right, (11, 11), (-1, -1), criteria)
-            imgpoints_left.append(corners_left)
-            imgpoints_right.append(corners_right)
-            objpoints.append(objp)
-            # 可选：显示检测结果
-            cv2.drawChessboardCorners(img_left, pattern_size, corners_left, ret_left)
-            cv2.drawChessboardCorners(img_right, pattern_size, corners_right, ret_right)
-            cv2.imshow("Left Chessboard", img_left)
-            cv2.imshow("Right Chessboard", img_right)
-            cv2.waitKey(50)
-        else:
-            print("棋盘角点未检测到：", left_file, right_file)
-    cv2.destroyAllWindows()
+    # ============= 5. First monocular calibration (left and right cameras) =============
+    ret_left, M1, d1, rvecs1, tvecs1 = cv2.calibrateCamera(
+        objpoints, imgpoints_left, image_size, None, None
+    )
+    ret_right, M2, d2, rvecs2, tvecs2 = cv2.calibrateCamera(
+        objpoints, imgpoints_right, image_size, None, None
+    )
 
-    # 假设所有图像尺寸一致，从第一幅图像获取尺寸
-    image_size = gray_left.shape[::-1]
+    print(f"First monocular calibration completed:")
+    print(f"  Left camera reprojection error: {ret_left:.4f}")
+    print(f"  Right camera reprojection error: {ret_right:.4f}")
 
-    # 3. 分别对左右相机进行单目标定
-    ret_left, M1, d1, rvecs1, tvecs1 = cv2.calibrateCamera(objpoints, imgpoints_left, image_size, None, None)
-    ret_right, M2, d2, rvecs2, tvecs2 = cv2.calibrateCamera(objpoints, imgpoints_right, image_size, None, None)
-    print("单目标定结果：")
-    print("左相机重投影误差: %.4f" % ret_left)
-    print("右相机重投影误差: %.4f" % ret_right)
+    # ============= 6. Compute per-frame monocular reprojection errors and remove outliers =============
+    # Set a threshold, adjustable as needed, e.g., 1.0 or 1.5
+    SINGLE_CAM_REPROJ_ERR_THRESH = 1.0
 
-    # 4. 立体标定（初始标定）
-    # 优化设置：使用单目标定结果作为初始猜测，固定主点，允许焦距和畸变系数优化
-    flags = 0
-    # flags |= cv2.CALIB_USE_INTRINSIC_GUESS
-    # flags |= cv2.CALIB_FIX_PRINCIPAL_POINT
-    # flags |= cv2.CALIB_SAME_FOCAL_LENGTH  # 如需强制左右焦距一致可启用
+    errsL = []
+    errsR = []
+    for i, (rvec, tvec) in enumerate(zip(rvecs1, tvecs1)):
+        projL, _ = cv2.projectPoints(objpoints[i], rvec, tvec, M1, d1)
+        errL = cv2.norm(imgpoints_left[i], projL, cv2.NORM_L2) / len(projL)
+        errsL.append(errL)
+
+    for i, (rvec, tvec) in enumerate(zip(rvecs2, tvecs2)):
+        projR, _ = cv2.projectPoints(objpoints[i], rvec, tvec, M2, d2)
+        errR = cv2.norm(imgpoints_right[i], projR, cv2.NORM_L2) / len(projR)
+        errsR.append(errR)
+
+    # Filter according to threshold
+    keep_indices = []
+    for i in range(len(objpoints)):
+        if errsL[i] < SINGLE_CAM_REPROJ_ERR_THRESH and errsR[i] < SINGLE_CAM_REPROJ_ERR_THRESH:
+            keep_indices.append(i)
+
+    num_all = len(objpoints)
+    num_drop = num_all - len(keep_indices)
+    if num_drop > 0:
+        print(
+            f"Removed {num_drop} outlier frames based on monocular reprojection error > {SINGLE_CAM_REPROJ_ERR_THRESH}")
+
+    # Remaining corner points after filtering
+    filtered_objpoints = [objpoints[i] for i in keep_indices]
+    filtered_imgpoints_left = [imgpoints_left[i] for i in keep_indices]
+    filtered_imgpoints_right = [imgpoints_right[i] for i in keep_indices]
+
+    # ============= 7. Monocular calibration again (using filtered data) =============
+    ret_left2, M1_2, d1_2, rvecs1_2, tvecs1_2 = cv2.calibrateCamera(
+        filtered_objpoints, filtered_imgpoints_left, image_size, None, None
+    )
+    ret_right2, M2_2, d2_2, rvecs2_2, tvecs2_2 = cv2.calibrateCamera(
+        filtered_objpoints, filtered_imgpoints_right, image_size, None, None
+    )
+    print(f"Monocular calibration after outlier removal completed:")
+    print(f"  Left camera reprojection error: {ret_left2:.4f}")
+    print(f"  Right camera reprojection error: {ret_right2:.4f}")
+
+    # ============= 8. Stereo calibration (fixing intrinsics) =============
+    # Let stereoCalibrate optimize only R, T, without modifying intrinsics
     criteria_stereo = (cv2.TERM_CRITERIA_MAX_ITER + cv2.TERM_CRITERIA_EPS, 100, 1e-6)
+    flags = cv2.CALIB_FIX_INTRINSIC
 
     ret_stereo, M1_stereo, d1_stereo, M2_stereo, d2_stereo, R, T, E, F = cv2.stereoCalibrate(
-        objpoints, imgpoints_left, imgpoints_right,
-        M1, d1, M2, d2, image_size,
-        criteria=criteria_stereo, flags=flags
+        filtered_objpoints,
+        filtered_imgpoints_left,
+        filtered_imgpoints_right,
+        M1_2, d1_2,  # Use second monocular calibration result as fixed starting point
+        M2_2, d2_2,
+        image_size,
+        criteria=criteria_stereo,
+        flags=flags
     )
+    print(f"Stereo calibration completed, reprojection error: {ret_stereo:.4f}")
 
     baseline = np.linalg.norm(T)
-    print("初始立体标定结果：")
-    print("立体标定重投影误差: %.4f" % ret_stereo)
-    print("平移向量 T (单位: 米):\n", T)
-    print("计算得到的基线距离: %.4f 米" % baseline)
+    print("Translation vector T:\n", T)
+    print(f"Baseline distance (meters): {baseline:.4f}")
 
-    # 5. 计算每对图像的重投影误差，并剔除误差较大的图像对
-    per_image_errors = []
-    for i in range(len(objpoints)):
-        # 分别用左右相机求解棋盘格姿态
-        ret_l, rvec_l, tvec_l = cv2.solvePnP(objpoints[i], imgpoints_left[i], M1_stereo, d1_stereo, flags=cv2.SOLVEPNP_ITERATIVE)
-        ret_r, rvec_r, tvec_r = cv2.solvePnP(objpoints[i], imgpoints_right[i], M2_stereo, d2_stereo, flags=cv2.SOLVEPNP_ITERATIVE)
-        proj_left, _ = cv2.projectPoints(objpoints[i], rvec_l, tvec_l, M1_stereo, d1_stereo)
-        proj_right, _ = cv2.projectPoints(objpoints[i], rvec_r, tvec_r, M2_stereo, d2_stereo)
-        err_left = cv2.norm(imgpoints_left[i], proj_left, cv2.NORM_L2) / np.sqrt(len(objpoints[i]))
-        err_right = cv2.norm(imgpoints_right[i], proj_right, cv2.NORM_L2) / np.sqrt(len(objpoints[i]))
-        per_err = max(err_left, err_right)
-        per_image_errors.append(per_err)
-    
-    mean_err = np.mean(per_image_errors)
-    std_err = np.std(per_image_errors)
-    threshold = mean_err + 2 * std_err
-    print("图像对重投影误差均值: %.4f 像素, 标准差: %.4f" % (mean_err, std_err))
-    print("剔除阈值设定为: %.4f 像素" % threshold)
-    
-    # 筛选出误差较大的图像对
-    good_indices = [i for i, err in enumerate(per_image_errors) if err <= threshold]
-    print("总共 %d 对图像中，剔除 %d 对异常图像" % (len(objpoints), len(objpoints) - len(good_indices)))
-    
-    # 若有剔除，则用过滤后的数据重新标定
-    if len(good_indices) < len(objpoints):
-        objpoints_filtered = [objpoints[i] for i in good_indices]
-        imgpoints_left_filtered = [imgpoints_left[i] for i in good_indices]
-        imgpoints_right_filtered = [imgpoints_right[i] for i in good_indices]
-        ret_stereo, M1_stereo, d1_stereo, M2_stereo, d2_stereo, R, T, E, F = cv2.stereoCalibrate(
-            objpoints_filtered, imgpoints_left_filtered, imgpoints_right_filtered,
-            M1, d1, M2, d2, image_size,
-            criteria=criteria_stereo, flags=flags
-        )
-        baseline = np.linalg.norm(T)
-        print("过滤后立体标定结果：")
-        print("立体标定重投影误差: %.4f" % ret_stereo)
-        print("平移向量 T (单位: 米):\n", T)
-        print("计算得到的基线距离: %.4f 米" % baseline)
-    else:
-        print("所有图像对均较好，无需剔除。")
-    
-    # 6. 立体校正，计算校正参数及 Q 矩阵
-    R1_rect, R2_rect, P1_rect, P2_rect, Q, roi1, roi2 = cv2.stereoRectify(
-        M1_stereo, d1_stereo, M2_stereo, d2_stereo, image_size, R, T,
-        flags=cv2.CALIB_ZERO_DISPARITY, alpha=0
-    )
-    
-    print("Q 矩阵:\n", Q)
-    # 可根据 Q 矩阵验证基线： Q[3,2] 的倒数（绝对值）应接近实际基线
-    if Q[3,2] != 0:
-        baseline_from_Q = 1.0 / abs(Q[3,2])
-        print("通过 Q 矩阵计算得到的基线: %.6f 米" % baseline_from_Q)
-    else:
-        print("Q 矩阵中基线信息异常。")
-    
-    # 7. 保存左右相机标定结果到 YAML 文件
-    calib_left = {
+    # ============= 9. Save final results into YAML (left.yaml, right.yaml) =============
+    # Note: Saving M1_stereo/d1_stereo/M2_stereo/d2_stereo and R, T after stereoCalibrate, same as original format
+    calib_dir = os.path.expanduser("~/stereo_calib_yaml_raw")
+    if not os.path.isdir(calib_dir):
+        os.makedirs(calib_dir)
+
+    # Left camera YAML
+    left_yaml_data = {
         "image_width": image_size[0],
         "image_height": image_size[1],
         "camera_name": "stereo_left",
-        "camera_matrix": {"rows": 3, "cols": 3, "data": M1_stereo.flatten().tolist()},
+        "camera_matrix": {
+            "rows": 3, "cols": 3,
+            "data": M1_stereo.flatten().tolist()
+        },
         "distortion_model": "plumb_bob",
-        "distortion_coefficients": {"rows": 1, "cols": len(d1_stereo), "data": d1_stereo.flatten().tolist()},
-        "rectification_matrix": {"rows": 3, "cols": 3, "data": R1_rect.flatten().tolist()},
-        "projection_matrix": {"rows": 3, "cols": 4, "data": P1_rect.flatten().tolist()}
+        "distortion_coefficients": {
+            "rows": 1, "cols": len(d1_stereo),
+            "data": d1_stereo.flatten().tolist()
+        },
+        "R_stereo": {
+            "rows": 3, "cols": 3,
+            "data": R.flatten().tolist()
+        },
+        "T_stereo": {
+            "rows": 3, "cols": 1,
+            "data": T.flatten().tolist()
+        }
     }
-    calib_right = {
+
+    # Right camera YAML
+    right_yaml_data = {
         "image_width": image_size[0],
         "image_height": image_size[1],
         "camera_name": "stereo_right",
-        "camera_matrix": {"rows": 3, "cols": 3, "data": M2_stereo.flatten().tolist()},
+        "camera_matrix": {
+            "rows": 3, "cols": 3,
+            "data": M2_stereo.flatten().tolist()
+        },
         "distortion_model": "plumb_bob",
-        "distortion_coefficients": {"rows": 1, "cols": len(d2_stereo), "data": d2_stereo.flatten().tolist()},
-        "rectification_matrix": {"rows": 3, "cols": 3, "data": R2_rect.flatten().tolist()},
-        "projection_matrix": {"rows": 3, "cols": 4, "data": P2_rect.flatten().tolist()}
+        "distortion_coefficients": {
+            "rows": 1, "cols": len(d2_stereo),
+            "data": d2_stereo.flatten().tolist()
+        },
+        # Also write R, T into right camera YAML
+        "R_stereo": {
+            "rows": 3, "cols": 3,
+            "data": R.flatten().tolist()
+        },
+        "T_stereo": {
+            "rows": 3, "cols": 1,
+            "data": T.flatten().tolist()
+        }
     }
-    
-    calib_dir = os.path.expanduser("~/stereo_calib_yaml")
-    if not os.path.isdir(calib_dir):
-        os.makedirs(calib_dir)
-    left_yaml = os.path.join(calib_dir, "left.yaml")
-    right_yaml = os.path.join(calib_dir, "right.yaml")
-    with open(left_yaml, "w") as f:
-        yaml.dump(calib_left, f)
-    with open(right_yaml, "w") as f:
-        yaml.dump(calib_right, f)
-    
-    print("标定结果已保存至：")
-    print(left_yaml)
-    print(right_yaml)
+
+    left_yaml_file = os.path.join(calib_dir, "left.yaml")
+    right_yaml_file = os.path.join(calib_dir, "right.yaml")
+    with open(left_yaml_file, "w") as f:
+        yaml.dump(left_yaml_data, f)
+    with open(right_yaml_file, "w") as f:
+        yaml.dump(right_yaml_data, f)
+
+    print("Calibration results after outlier removal have been saved:")
+    print(left_yaml_file)
+    print(right_yaml_file)
 
 if __name__ == '__main__':
     main()

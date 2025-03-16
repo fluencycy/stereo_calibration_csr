@@ -9,222 +9,253 @@ from sensor_msgs.msg import Image
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 
 #############################################################################
-# 加载标定参数（从 YAML 文件），确保 YAML 中包含必要字段
+# Load calibration parameters (from YAML file), required fields only:
+#  - image_width, image_height, distortion_model
+#  - distortion_coefficients, camera_matrix
+#  - R_stereo, T_stereo
 #############################################################################
-def load_calibration(yaml_file):
-    try:
-        with open(yaml_file, "r") as file:
-            calib_data = yaml.safe_load(file)
-        rospy.loginfo("成功加载 YAML 文件：{}".format(yaml_file))
-        required_keys = ["image_width", "image_height", "distortion_model",
-                         "distortion_coefficients", "camera_matrix",
-                         "rectification_matrix", "projection_matrix"]
-        for key in required_keys:
-            if key not in calib_data:
-                rospy.logfatal("YAML 文件 {} 缺少关键字段：{}".format(yaml_file, key))
-                rospy.signal_shutdown("缺少关键字段")
-        calib = {}
-        calib["image_width"] = int(calib_data["image_width"])
-        calib["image_height"] = int(calib_data["image_height"])
-        calib["D"] = np.array(calib_data["distortion_coefficients"]["data"], dtype=np.float32)
-        calib["K"] = np.array(calib_data["camera_matrix"]["data"], dtype=np.float32).reshape(3, 3)
-        calib["R"] = np.array(calib_data["rectification_matrix"]["data"], dtype=np.float32).reshape(3, 3)
-        calib["P"] = np.array(calib_data["projection_matrix"]["data"], dtype=np.float32).reshape(3, 4)
-        return calib
-    except Exception as e:
-        rospy.logfatal("加载 YAML 文件 {} 失败：{}".format(yaml_file, e))
-        rospy.signal_shutdown("加载 YAML 文件失败")
-        return None
+def load_calibration(yaml_file, camera_name=""):
+    with open(yaml_file, "r") as file:
+        calib_data = yaml.safe_load(file)
+    rospy.loginfo("Successfully loaded YAML file: {} -> {}".format(yaml_file, camera_name))
+
+    required_keys = [
+        "image_width",
+        "image_height",
+        "distortion_model",
+        "distortion_coefficients",
+        "camera_matrix",
+        "R_stereo",
+        "T_stereo"
+    ]
+    for key in required_keys:
+        if key not in calib_data:
+            rospy.logfatal("YAML file {} is missing key field: {}".format(yaml_file, key))
+            rospy.signal_shutdown("Missing key field")
+            return None
+
+    calib = {}
+    calib["image_width"] = int(calib_data["image_width"])
+    calib["image_height"] = int(calib_data["image_height"])
+    calib["distortion_model"] = calib_data["distortion_model"]
+
+    # Distortion coefficients
+    dist_coeffs = calib_data["distortion_coefficients"]["data"]
+    calib["D"] = np.array(dist_coeffs, dtype=np.float64)
+
+    # Camera matrix
+    cam_matrix = calib_data["camera_matrix"]["data"]
+    calib["K"] = np.array(cam_matrix, dtype=np.float64).reshape(3, 3)
+
+    # Stereo extrinsics: R_stereo, T_stereo
+    R_st = calib_data["R_stereo"]["data"]
+    T_st = calib_data["T_stereo"]["data"]
+    # Note the reshape
+    calib["R_stereo"] = np.array(R_st, dtype=np.float64).reshape(3, 3)
+    calib["T_stereo"] = np.array(T_st, dtype=np.float64).reshape(3, 1)
+
+    return calib
 
 #############################################################################
-# 计算棋盘格中所有横向相邻角点的距离平均值
-# 输入：检测到的亚像素角点 corners_sub (shape: [N,1,2])
-#        board_size: (num_cols, num_rows) 内角点数，如 (10,9)
-# 返回：平均距离（单位与 3D 重投影一致，通常为米）
+# Configure checkerboard specification (inner corners), used for real-time measuring
 #############################################################################
-def compute_average_square_length(corners_sub, board_size):
-    num_cols, num_rows = board_size  # num_cols: 每行角点数；num_rows: 行数
-    if corners_sub.shape[0] != num_cols * num_rows:
-        rospy.logwarn("角点数量与预期不符！预期: {}，实际: {}".format(num_cols * num_rows, corners_sub.shape[0]))
-        return None
-    distances = []
-    # 对每一行，计算相邻角点之间的欧氏距离
-    for r in range(num_rows):
-        for c in range(num_cols - 1):
-            idx1 = r * num_cols + c
-            idx2 = r * num_cols + c + 1
-            pt1 = corners_sub[idx1][0]
-            pt2 = corners_sub[idx2][0]
-            d = np.linalg.norm(pt2 - pt1)
-            if np.isfinite(d):
-                distances.append(d)
-    if len(distances) == 0:
-        return None
-    avg_distance = np.mean(distances)
-    return avg_distance
+pattern_size = (11, 9)  # (columns, rows), example: 9x6
+criteria_subpix = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
 
 #############################################################################
-# stereo_callback: 接收左右图像，进行图像校正、立体匹配、3D 重投影，
-# 并进行两处测量：棋盘格一整排方块尺寸平均值测量与图像中心深度测量
+# stereo_callback: perform image rectification, stereo matching, re-projection,
+# and display depth + checkerboard measurement
 #############################################################################
 def stereo_callback(left_img_msg, right_img_msg):
     try:
         left_img = bridge.imgmsg_to_cv2(left_img_msg, "bgr8")
         right_img = bridge.imgmsg_to_cv2(right_img_msg, "bgr8")
     except CvBridgeError as e:
-        rospy.logerr("图像转换错误: %s", e)
+        rospy.logerr("Image conversion error: %s", e)
         return
 
-    # 1. 图像校正
+    # 1. Rectification (remap)
     rect_left = cv2.remap(left_img, left_map1, left_map2, cv2.INTER_LINEAR)
     rect_right = cv2.remap(right_img, right_map1, right_map2, cv2.INTER_LINEAR)
 
-    # 2. 转为灰度图
+    # 2. Convert to grayscale
     gray_left = cv2.cvtColor(rect_left, cv2.COLOR_BGR2GRAY)
     gray_right = cv2.cvtColor(rect_right, cv2.COLOR_BGR2GRAY)
 
-    # 3. 计算左右视差（先计算左右视差，再利用 WLS 滤波）
-    # 计算左视差（注意输出为 int16，值需要除以16转为实际视差）
+    # 3. Compute disparity (SGBM + WLS)
     left_disp = stereo.compute(gray_left, gray_right).astype(np.int16)
-    # 计算右视差
     right_disp = right_matcher.compute(gray_right, gray_left).astype(np.int16)
-    # 使用 WLS 滤波器对左视差进行后处理
     filtered_disp = wls_filter.filter(left_disp, gray_left, None, right_disp)
-    # 转换为 float32，并除以16得到实际视差
     filtered_disp = np.float32(filtered_disp) / 16.0
-    # 将小于1.0的视差置0
-    filtered_disp[filtered_disp < 1.0] = 0
+    filtered_disp[filtered_disp < 1.0] = 0  # Set values less than 1 to 0 (invalid)
 
-    # 4. 利用滤波后的视差图重投影到3D空间（单位通常为米）
-    points_3D = cv2.reprojectImageTo3D(filtered_disp, Q)
+    # 4. Reproject disparity map to 3D
+    points_3D = cv2.reprojectImageTo3D(filtered_disp, Q)  # Unit: meters (if T is in meters)
 
-    # 5. 测量图像中心深度
+    # 5. Measure center depth (demo)
     h, w = gray_left.shape
-    center_x, center_y = w // 2, h // 2
-    center_point = points_3D[center_y, center_x]
-    center_depth = center_point[2]
-    center_depth_mm = center_depth * 1000.0
-    cv2.circle(rect_left, (center_x, center_y), 5, (0, 0, 255), -1)
+    cx, cy = w // 2, h // 2
+    center_3D = points_3D[cy, cx]  # (X, Y, Z)
+    center_depth_m = center_3D[2]
+    center_depth_mm = center_depth_m * 1000.0
+    cv2.circle(rect_left, (cx, cy), 5, (0, 0, 255), -1)
     cv2.putText(rect_left, "Center Depth: {:.2f} mm".format(center_depth_mm),
-                (center_x - 150, center_y - 20), cv2.FONT_HERSHEY_SIMPLEX,
+                (cx - 150, cy - 20), cv2.FONT_HERSHEY_SIMPLEX,
                 0.8, (0, 0, 255), 2)
 
-    # 6. 检测棋盘格并测量一整排方块的平均长度
-    # 假设棋盘内角点数为 (10,9)（即每行10个角点，代表9个方块）
-    board_pattern = (12, 9)
-    ret, corners = cv2.findChessboardCorners(gray_left, board_pattern,
-                                              cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE)
-    square_length_avg = None
+    ############################################################################
+    # 6. (New) Detect checkerboard corners and calculate length of all squares
+    #    - Find corners on rect_left
+    #    - Project to 3D for coordinates
+    #    - Compute distance between adjacent corners, output matrix & average
+    ############################################################################
+    ret, corners2D = cv2.findChessboardCorners(gray_left, pattern_size,
+                                               flags=cv2.CALIB_CB_ADAPTIVE_THRESH +
+                                                     cv2.CALIB_CB_NORMALIZE_IMAGE +
+                                                     cv2.CALIB_CB_FAST_CHECK)
     if ret:
-        criteria_sub = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-        corners_sub = cv2.cornerSubPix(gray_left, corners, (11, 11), (-1, -1), criteria_sub)
-        cv2.drawChessboardCorners(rect_left, board_pattern, corners_sub, ret)
-        # 遍历每一行，计算相邻角点之间的 3D 距离（使用重投影结果）
-        num_cols, num_rows = board_pattern
-        distances = []
-        for r in range(num_rows):
-            for c in range(num_cols - 1):
-                idx1 = r * num_cols + c
-                idx2 = r * num_cols + c + 1
-                pt1 = corners_sub[idx1][0]
-                pt2 = corners_sub[idx2][0]
-                x1, y1 = int(round(pt1[0])), int(round(pt1[1]))
-                x2, y2 = int(round(pt2[0])), int(round(pt2[1]))
-                if (0 <= x1 < points_3D.shape[1] and 0 <= y1 < points_3D.shape[0] and
-                    0 <= x2 < points_3D.shape[1] and 0 <= y2 < points_3D.shape[0]):
-                    P1 = points_3D[y1, x1]
-                    P2 = points_3D[y2, x2]
-                    d = np.linalg.norm(P2 - P1)
-                    if np.isfinite(d):
-                        distances.append(d)
-        if len(distances) > 0:
-            square_length_avg = np.mean(distances) * 1000.0  # 转换为毫米
-            cv2.putText(rect_left, "Square Avg: {:.2f} mm".format(square_length_avg), (30, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
-            rospy.loginfo("测量到的平均方块边长: {:.2f} mm".format(square_length_avg))
-        else:
-            rospy.logwarn("未能获取有效的方块测量值。")
-    else:
-        rospy.loginfo("未检测到棋盘格，请确保标定板在视野内。")
+        # Refine to subpixel accuracy
+        corners2D = cv2.cornerSubPix(gray_left, corners2D, (11, 11), (-1, -1), criteria_subpix)
 
-    # 7. 显示结果（可选：归一化后的视差图）
+        # Convert 2D corners to 3D
+        corners2D = corners2D.reshape(-1, 2)
+        corner_points_3d = []
+        for pt in corners2D:
+            x2d, y2d = pt
+            x2d_int = int(round(x2d))
+            y2d_int = int(round(y2d))
+            # Check if within image boundaries
+            if 0 <= x2d_int < w and 0 <= y2d_int < h:
+                p3d = points_3D[y2d_int, x2d_int]  # (X, Y, Z)
+                corner_points_3d.append(p3d)
+            else:
+                corner_points_3d.append([0, 0, 0])
+
+        corner_points_3d = np.array(corner_points_3d).reshape(
+            (pattern_size[1], pattern_size[0], 3)
+        )  # Shape: (rows, columns, 3)
+
+        # Calculate horizontal and vertical distances between adjacent corners
+        horiz_dist_mat = np.zeros((pattern_size[1], pattern_size[0]-1), dtype=np.float32)
+        vert_dist_mat = np.zeros((pattern_size[1]-1, pattern_size[0]), dtype=np.float32)
+
+        # Horizontal distances
+        for row in range(pattern_size[1]):
+            for col in range(pattern_size[0] - 1):
+                p1 = corner_points_3d[row, col]
+                p2 = corner_points_3d[row, col+1]
+                dist = np.linalg.norm(p2 - p1) if p1[2] > 0.0001 and p2[2] > 0.0001 else 0.0
+                horiz_dist_mat[row, col] = dist
+
+        # Vertical distances
+        for row in range(pattern_size[1] - 1):
+            for col in range(pattern_size[0]):
+                p1 = corner_points_3d[row, col]
+                p2 = corner_points_3d[row+1, col]
+                dist = np.linalg.norm(p2 - p1) if p1[2] > 0.0001 and p2[2] > 0.0001 else 0.0
+                vert_dist_mat[row, col] = dist
+
+        # Print matrices
+        rospy.loginfo("Horizontal length matrix (m):\n{}".format(horiz_dist_mat))
+        rospy.loginfo("Vertical length matrix (m):\n{}".format(vert_dist_mat))
+
+        # Calculate average length (excluding zeros)
+        horiz_nonzero = horiz_dist_mat[horiz_dist_mat > 0.0]
+        vert_nonzero = vert_dist_mat[vert_dist_mat > 0.0]
+        if len(horiz_nonzero) + len(vert_nonzero) > 0:
+            avg_len_m = np.mean(np.concatenate((horiz_nonzero, vert_nonzero)))
+            avg_len_mm = avg_len_m * 1000.0
+            rospy.loginfo("Average length of the checkerboard: {:.3f} mm".format(avg_len_mm))
+
+        # Visualize corners on rect_left
+        cv2.drawChessboardCorners(rect_left, pattern_size, corners2D.reshape(-1, 1, 2), True)
+    # 7. Display disparity and left rectified image (with corners)
     disp_vis = cv2.normalize(filtered_disp, None, 0, 255, cv2.NORM_MINMAX)
     disp_vis = np.uint8(disp_vis)
-    cv2.imshow("Rectified Left", rect_left)
-    # 如需显示右图和视差图，可解除下面注释
-    # cv2.imshow("Rectified Right", rect_right)
+    cv2.imshow("Rectified Left + Chessboard", rect_left)
     cv2.imshow("Disparity", disp_vis)
     cv2.waitKey(1)
-    rospy.loginfo("Center depth: {:.2f} mm".format(center_depth_mm))
+
+    # Log center depth (for demonstration)
+    rospy.loginfo("Depth at the center: {:.2f} mm".format(center_depth_mm))
+
 
 #############################################################################
-# 主函数：加载标定参数、初始化映射表、构造 Q 矩阵、设置 StereoSGBM 和 WLS 滤波器，
-# 并订阅左右图像
+# Main function: load calibration files, perform stereoRectify, and subscribe to stereo images
 #############################################################################
 if __name__ == "__main__":
-    rospy.init_node("stereo_matching_with_measure_optimized", anonymous=True)
+    rospy.init_node("stereo_matching_node", anonymous=True)
     bridge = CvBridge()
 
-    # 从 ROS 参数中获取左右相机标定文件路径
-    left_yaml_path = rospy.get_param('~left_yaml', '/home/cliu226/stereo_calib_yaml/left.yaml')
-    right_yaml_path = rospy.get_param('~right_yaml', '/home/cliu226/stereo_calib_yaml/right.yaml')
+    # 1. Load left and right calibration YAML (containing only K, D, R_stereo, T_stereo)
+    left_yaml_path = rospy.get_param('~left_yaml', '/home/cliu226/stereo_calib_yaml_raw/left.yaml')
+    right_yaml_path = rospy.get_param('~right_yaml', '/home/cliu226/stereo_calib_yaml_raw/right.yaml')
 
-    left_calib = load_calibration(left_yaml_path)
-    right_calib = load_calibration(right_yaml_path)
+    left_calib = load_calibration(left_yaml_path, camera_name="LeftCamera")
+    right_calib = load_calibration(right_yaml_path, camera_name="RightCamera")
     if left_calib is None or right_calib is None:
-        rospy.logfatal("加载标定数据失败")
+        rospy.logfatal("Failed to load calibration data")
         exit(1)
 
-    image_size = (left_calib["image_width"], left_calib["image_height"])
-    rospy.loginfo("图像尺寸: {}".format(image_size))
+    width = left_calib["image_width"]
+    height = left_calib["image_height"]
+    K_left = left_calib["K"]
+    D_left = left_calib["D"]
+    K_right = right_calib["K"]
+    D_right = right_calib["D"]
+    R_stereo = left_calib["R_stereo"]  # Left to Right
+    T_stereo = left_calib["T_stereo"]  # Left to Right
 
-    # 计算左右图像校正映射
+    # If T_stereo is in meters, no need to convert; if in mm during calibration, uncomment next line:
+    # T_stereo /= 1000.0  # Uncomment if unit was mm during calibration
+
+    image_size = (width, height)
+    rospy.loginfo("Image size: {}".format(image_size))
+
+    # 2. Perform stereoRectify
+    R1, R2, P1, P2, Q, roi1, roi2 = cv2.stereoRectify(
+        cameraMatrix1=K_left,
+        distCoeffs1=D_left,
+        cameraMatrix2=K_right,
+        distCoeffs2=D_right,
+        imageSize=image_size,
+        R=R_stereo,
+        T=T_stereo,
+        flags=cv2.CALIB_ZERO_DISPARITY,
+        alpha=0
+    )
+    rospy.loginfo("stereoRectify done, Q matrix:\n{}".format(Q))
+
+    # 3. initUndistortRectifyMap
     left_map1, left_map2 = cv2.initUndistortRectifyMap(
-        left_calib["K"], left_calib["D"], left_calib["R"],
-        left_calib["P"][:, :3], image_size, cv2.CV_16SC2)
+        K_left, D_left, R1, P1, image_size, cv2.CV_16SC2
+    )
     right_map1, right_map2 = cv2.initUndistortRectifyMap(
-        right_calib["K"], right_calib["D"], right_calib["R"],
-        right_calib["P"][:, :3], image_size, cv2.CV_16SC2)
+        K_right, D_right, R2, P2, image_size, cv2.CV_16SC2
+    )
 
-    # 构造 Q 矩阵（用于从视差到 3D 重投影）
-    fx = left_calib["K"][0, 0]
-    cx = left_calib["K"][0, 2]
-    cy = left_calib["K"][1, 2]
-    Tx = -left_calib["P"][0, 3] / fx
-    if abs(Tx) < 1e-6:
-        Tx = -right_calib["P"][0, 3] / fx
-    Q = np.array([[1, 0, 0, -cx],
-                  [0, 1, 0, -cy],
-                  [0, 0, 0,  fx],
-                  [0, 0, -1/Tx, 0]], dtype=np.float32)
-    rospy.loginfo("Q矩阵:\n{}".format(Q))
-
-    # 设置 StereoSGBM 参数（请根据实际场景调整）
-    blockSize = 5
-    numDisparities = 128  # 必须为16的倍数
+    # 4. Configure stereo matching (SGBM + WLS), tune parameters as needed for your scene
+    blockSize = 10
+    numDisparities = 64
     stereo = cv2.StereoSGBM_create(
         minDisparity=0,
         numDisparities=numDisparities,
         blockSize=blockSize,
-        P1=8 * 1 * blockSize**2,
-        P2=32 * 1 * blockSize**2,
+        P1=8 * blockSize**2,
+        P2=32 * blockSize**2,
         disp12MaxDiff=1,
         preFilterCap=31,
         uniquenessRatio=10,
         speckleWindowSize=100,
         speckleRange=2
     )
-
-    # 创建 WLS 滤波器，并配置参数
     wls_filter = ximgproc.createDisparityWLSFilter(matcher_left=stereo)
-    # 参数 lambda: 越大平滑性越好，但会丢失细节；建议范围 8000～10000
-    wls_filter.setLambda(8000)
-    # 参数 sigmaColor: 控制边缘保留，建议 1.5～2.0
-    wls_filter.setSigmaColor(1.5)
-    # 创建右匹配器
+    # You can fine-tune lambda and sigmaColor based on your scene
+    wls_filter.setLambda(30000)
+    wls_filter.setSigmaColor(1)
     right_matcher = ximgproc.createRightMatcher(stereo)
 
-    # 同步订阅左右图像话题，确保名称正确
+    # 5. Subscribe to left and right image topics with synchronization
     left_topic = rospy.get_param('~left_image_topic', '/csr_full_test/left/image_raw')
     right_topic = rospy.get_param('~right_image_topic', '/csr_full_test/right/image_raw')
     left_sub = Subscriber(left_topic, Image)
@@ -232,6 +263,6 @@ if __name__ == "__main__":
     ats = ApproximateTimeSynchronizer([left_sub, right_sub], queue_size=5, slop=0.1)
     ats.registerCallback(stereo_callback)
 
-    rospy.loginfo("stereo_matching_with_measure_optimized 节点启动，等待图像话题...")
+    rospy.loginfo("Stereo matching node started, waiting for stereo image streams ...")
     rospy.spin()
     cv2.destroyAllWindows()
